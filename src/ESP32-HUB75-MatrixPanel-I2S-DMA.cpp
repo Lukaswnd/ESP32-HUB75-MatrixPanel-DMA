@@ -165,7 +165,7 @@ bool MatrixPanel_I2S_DMA::allocateDMAmemory()
 
 
 
-void MatrixPanel_I2S_DMA::configureDMA(const HUB75_I2S_CFG& _cfg)
+void MatrixPanel_I2S_DMA::configureDMA()
 {
 
  //   lldesc_t *previous_dmadesc_a     = 0;
@@ -786,6 +786,8 @@ void MatrixPanel_I2S_DMA::brtCtrlOEv2(uint8_t brt, const int _buff_id) {
  
 bool MatrixPanel_I2S_DMA::begin(int r1, int g1, int b1, int r2, int g2, int b2, int a, int b, int c, int d, int e, int lat, int oe, int clk) {
 
+  if(initialized)
+    return false;
   // RGB
   m_cfg.gpio.r1 = r1; m_cfg.gpio.g1 = g1; m_cfg.gpio.b1 = b1;
   m_cfg.gpio.r2 = r2; m_cfg.gpio.g2 = g2; m_cfg.gpio.b2 = b2;
@@ -797,6 +799,24 @@ bool MatrixPanel_I2S_DMA::begin(int r1, int g1, int b1, int r2, int g2, int b2, 
   // Clock & Control
   m_cfg.gpio.lat = lat; m_cfg.gpio.oe = oe; m_cfg.gpio.clk = clk;
 
+  return begin();
+}
+
+bool MatrixPanel_I2S_DMA::begin(const HUB75_I2S_CFG& cfg, int r1, int g1, int b1, int r2, int g2, int b2, int a, int b, int c, int d, int e, int lat, int oe, int clk){
+  if(initialized)
+    return false;
+
+  m_cfg = cfg;
+  config_set = true;
+
+  return begin(r1, g1, b1, r2, g2, b2,a, b, c, d, e, lat, oe, clk);
+}
+bool MatrixPanel_I2S_DMA::begin(const HUB75_I2S_CFG& cfg){
+  if(initialized)
+    return false;
+
+  m_cfg = cfg;
+  config_set = true;
   return begin();
 }
 

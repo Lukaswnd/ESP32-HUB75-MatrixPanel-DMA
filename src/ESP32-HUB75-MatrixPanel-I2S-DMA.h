@@ -372,21 +372,24 @@ class MatrixPanel_I2S_DMA {
     /**
      * MatrixPanel_I2S_DMA 
      * 
-     * @param  {HUB75_I2S_CFG} opts : structure with matrix configuration
+     * @param  {HUB75_I2S_CFG} cfg : structure with matrix configuration
      *        
      */
-    MatrixPanel_I2S_DMA(const HUB75_I2S_CFG& opts) :
+    MatrixPanel_I2S_DMA(const HUB75_I2S_CFG& cfg) :
 #ifdef USE_GFX_ROOT 
-      GFX(opts.mx_width*opts.chain_length, opts.mx_height),
+      GFX(cfg.mx_width*cfg.chain_length, cfg.mx_height),
 #elif !defined NO_GFX
-      Adafruit_GFX(opts.mx_width*opts.chain_length, opts.mx_height),
+      Adafruit_GFX(cfg.mx_width*cfg.chain_length, cfg.mx_height),
 #endif        
-      m_cfg(opts) {}
+      m_cfg(cfg) {
+        config_set = true;
+      }
 
     /* Propagate the DMA pin configuration, allocate DMA buffs and start data output, initially blank */
     bool begin(){
         
-      if (initialized) return true; // we don't do this twice or more!
+      if (initialized) return false; // we don't do this twice or more!
+      if(!config_set) return false;
 
 
       ESP_LOGI("begin()", "Using GPIO %d for R1_PIN", m_cfg.gpio.r1);
@@ -407,7 +410,7 @@ class MatrixPanel_I2S_DMA {
 
       // initialize some specific panel drivers
       if (m_cfg.driver)
-        shiftDriver(m_cfg);
+        shiftDriver();
           
         #if defined(SPIRAM_DMA_BUFFER)     
 		 // Trick library into dropping colour depth slightly when using PSRAM.
@@ -425,7 +428,7 @@ class MatrixPanel_I2S_DMA {
       resetbuffers(); // Must fill the DMA buffer with the initial output bit sequence or the panel will display garbage
 
       // Setup the ESP32 DMA Engine. Sprite_TM built this stuff.
-      configureDMA(m_cfg); //DMA and I2S configuration and setup
+      configureDMA(); //DMA and I2S configuration and setup
 
       //showDMABuffer(); // show backbuf_id of 0
 
@@ -449,7 +452,8 @@ class MatrixPanel_I2S_DMA {
      *  overload for compatibility
      */
     bool begin(int r1, int g1 = G1_PIN_DEFAULT, int b1 = B1_PIN_DEFAULT, int r2 = R2_PIN_DEFAULT, int g2 = G2_PIN_DEFAULT, int b2 = B2_PIN_DEFAULT, int a  = A_PIN_DEFAULT, int b = B_PIN_DEFAULT, int c = C_PIN_DEFAULT, int d = D_PIN_DEFAULT, int e = E_PIN_DEFAULT, int lat = LAT_PIN_DEFAULT, int oe = OE_PIN_DEFAULT, int clk = CLK_PIN_DEFAULT);
-
+    bool begin(const HUB75_I2S_CFG& cfg, int r1, int g1 = G1_PIN_DEFAULT, int b1 = B1_PIN_DEFAULT, int r2 = R2_PIN_DEFAULT, int g2 = G2_PIN_DEFAULT, int b2 = B2_PIN_DEFAULT, int a  = A_PIN_DEFAULT, int b = B_PIN_DEFAULT, int c = C_PIN_DEFAULT, int d = D_PIN_DEFAULT, int e = E_PIN_DEFAULT, int lat = LAT_PIN_DEFAULT, int oe = OE_PIN_DEFAULT, int clk = CLK_PIN_DEFAULT);
+    bool begin(const HUB75_I2S_CFG& cfg);
 
     // Adafruit's BASIC DRAW API (565 colour format)
     virtual void drawPixel(int16_t x, int16_t y, uint16_t color);   // overwrite adafruit implementation
@@ -670,7 +674,14 @@ class MatrixPanel_I2S_DMA {
      * Get a class configuration struct
      * 
      */
-    const HUB75_I2S_CFG& getCfg() const {return m_cfg;};
+    inline const HUB75_I2S_CFG& getCfg() const {return m_cfg;};
+    inline bool setCfg(const HUB75_I2S_CFG& cfg) {
+      if(initialized)
+        return false;
+
+      m_cfg = cfg;
+      return true;
+    };
     
     
     /** 
@@ -774,6 +785,7 @@ class MatrixPanel_I2S_DMA {
     const uint16_t  PIXELS_PER_ROW = m_cfg.mx_width * m_cfg.chain_length;   // number of pixels in a single row of all chained matrix modules (WIDTH of a combined matrix chain)
 
     // Other private variables
+    bool config_set           = false;
     bool initialized          = false;
     int  active_gfx_writes    = 0;                  // How many async routines are 'drawing' (writing) to the DMA bit buffer. Function called from Adafruit_GFX draw routines like drawCircle etc.
     int  back_buffer_id       = 0;                       // If using double buffer, which one is NOT active (ie. being displayed) to write too?
@@ -802,18 +814,18 @@ class MatrixPanel_I2S_DMA {
     bool allocateDMAmemory();
 
     /* Setup the DMA Link List chain and initiate the ESP32 DMA engine */
-    void configureDMA(const HUB75_I2S_CFG& opts);
+    void configureDMA();
 
     /**
      * pre-init procedures for specific drivers
      * 
      */
-    void shiftDriver(const HUB75_I2S_CFG& opts);
+    void shiftDriver();
 
     /**
      * @brief - FM6124-family chips initialization routine
      */
-    void fm6124init(const HUB75_I2S_CFG& _cfg);
+    void fm6124init();
 
     /**
      * @brief - reset OE bits in DMA buffer in a way to control brightness
