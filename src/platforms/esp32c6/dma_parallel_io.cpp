@@ -56,7 +56,7 @@ bool Bus_Parallel16::init(void)
     // Reset LCD bus
     parlio_ll_tx_reset_fifo(&PARL_IO);
     esp_rom_delay_us(1000);
-
+    _cfg.bus_freq = 1000*100;
 
     parlio_ll_clock_source_t clk_src = (parlio_ll_clock_source_t)PARLIO_CLK_SRC_DEFAULT;
     uint32_t periph_src_clk_hz = 0;
@@ -139,7 +139,7 @@ bool Bus_Parallel16::init(void)
     gpio_set_drive_capability((gpio_num_t)_cfg.pin_wr, (gpio_drive_cap_t)3);
 
     parlio_ll_tx_set_idle_data_value(&PARL_IO, 0);
-    parlio_ll_tx_set_trans_bit_len(&PARL_IO, ((1<<16) -1) * 8);
+    parlio_ll_tx_set_trans_bit_len(&PARL_IO, 0);//((1<<16) -1) * 8);
 
     return true; // no return val = illegal instruction
 }
