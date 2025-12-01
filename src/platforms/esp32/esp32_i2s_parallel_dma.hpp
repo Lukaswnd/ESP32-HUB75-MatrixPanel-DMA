@@ -27,6 +27,8 @@ Contributors:
 /----------------------------------------------------------------------------*/
 
 #pragma once
+#include <sdkconfig.h>
+#if defined (CONFIG_IDF_TARGET_ESP32) || defined (CONFIG_IDF_TARGET_ESP32S2)
 
 #include <string.h> // memcpy
 #include <algorithm>
@@ -152,3 +154,6 @@ i2s_dev_t* getDev();
     
 
   };
+
+
+  #endif

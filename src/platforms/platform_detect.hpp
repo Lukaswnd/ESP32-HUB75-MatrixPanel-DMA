@@ -63,7 +63,21 @@ Modified heavily for the ESP32 HUB75 DMA library by:
 
  #elif defined(CONFIG_IDF_TARGET_ESP32P4)
 
-   #pragma message "You are ahead of your time. ESP32P4 support is planned"
+  #pragma message "Compiling for ESP32-P4 (platform_detect.hpp)"
+  #include "esp32p4/gdma_lcd_parallel16_p4.hpp"
+  #include "esp32p4/esp32p4-default-pins.hpp"
+  
+  #if defined(SPIRAM_FRAMEBUFFER)
+	#pragma message "Use SPIRAM_DMA_BUFFER instead."
+  #endif
+
+  #if defined(SPIRAM_DMA_BUFFER)
+   #pragma message "Enabling use of PSRAM/SPIRAM based DMA Buffer"
+   
+   // Disable fast functions because I don't understand the interaction with DMA PSRAM and the CPU->DMA->SPIRAM Cache implications..
+   #define NO_FAST_FUNCTIONS 1
+
+  #endif
 
  #elif defined (CONFIG_IDF_TARGET_ESP32) || defined(ESP32)
 

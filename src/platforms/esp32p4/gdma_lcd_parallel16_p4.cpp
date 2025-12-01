@@ -16,17 +16,17 @@
  PLEASE SUPPORT THEM!
 
  ********************************************************************************************/
-#include <sdkconfig.h>
 
-#ifdef CONFIG_IDF_TARGET_ESP32S3
-// Stop compile errors: /src/platforms/esp32s3/gdma_lcd_parallel16.hpp:64:10: fatal error: hal/lcd_ll.h: No such file or directory
-  #pragma message "Compiling for ESP32-S3"
+#include <sdkconfig.h>
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+
+  #pragma message "Compiling gdma lcd for ESP32-P4"
 
   #ifdef ARDUINO_ARCH_ESP32
      #include <Arduino.h>
   #endif
 
-  #include "gdma_lcd_parallel16.hpp"
+  #include "gdma_lcd_parallel16_p4.hpp"
   #include "esp_attr.h"
   #include "esp_idf_version.h"
 
@@ -80,9 +80,13 @@
  {
     ///dmabuff2 = (uint16_t*)heap_caps_malloc(sizeof(uint16_t) * 64*32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
+    
+    PERIPH_RCC_ATOMIC() {                                                                                         
+                                                                                                      
+      
     // LCD_CAM peripheral isn't enabled by default -- MUST begin with this:
-    periph_module_enable(PERIPH_LCD_CAM_MODULE);
-    periph_module_reset(PERIPH_LCD_CAM_MODULE);
+    //periph_module_enable(PERIPH_LCD_CAM_MODULE);
+    //periph_module_reset(PERIPH_LCD_CAM_MODULE);
 
     // Reset LCD bus
     LCD_CAM.lcd_user.lcd_reset = 1;
@@ -170,16 +174,16 @@
     // to provide generic 8-bit output rather than actually driving an LCD.
     // There's also a 16-bit mode but that's not shown here.
     LCD_CAM.lcd_ctrl.lcd_rgb_mode_en = 0;    // i8080 mode (not RGB)
-    LCD_CAM.lcd_rgb_yuv.lcd_conv_bypass = 0; // Disable RGB/YUV converter
+    //LCD_CAM.lcd_rgb_yuv.lcd_conv_bypass = 0; // Disable RGB/YUV converter
     LCD_CAM.lcd_misc.lcd_next_frame_en = 0;  // Do NOT auto-frame
 
     LCD_CAM.lcd_misc.lcd_bk_en = 1;          // https://esp32.com/viewtopic.php?t=24459&start=60#p91835
     
-    LCD_CAM.lcd_data_dout_mode.val = 0;      // No data delays
+    //LCD_CAM.lcd_data_dout_mode.val = 0;      // No data delays
     LCD_CAM.lcd_user.lcd_always_out_en = 1;  // Enable 'always out' mode
-    LCD_CAM.lcd_user.lcd_8bits_order = 0;    // Do not swap bytes
+    LCD_CAM.lcd_user.lcd_byte_order = 0;    // Do not swap bytes
     LCD_CAM.lcd_user.lcd_bit_order = 0;      // Do not reverse bit order
-    LCD_CAM.lcd_user.lcd_2byte_en = 1;       // 8-bit data mode
+    //LCD_CAM.lcd_user.lcd_2byte_en = 1;       // 8-bit data mode
     LCD_CAM.lcd_user.lcd_dummy = 1;          // Dummy phase(s) @ LCD start
     LCD_CAM.lcd_user.lcd_dummy_cyclelen = 1; // 1+1 dummy phase
     LCD_CAM.lcd_user.lcd_cmd = 0;            // No command at LCD start
@@ -202,7 +206,7 @@
     for(int i = 0; i < 16; i++) 
     {
       if (pins[i] >= 0) { // -1 value will CRASH the ESP32!
-        esp_rom_gpio_connect_out_signal(pins[i], LCD_DATA_OUT0_IDX + i, false, false);
+        esp_rom_gpio_connect_out_signal(pins[i], LCD_DATA_OUT_PAD_OUT0_IDX + i, false, false);
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)		
         // https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/issues/803
 		gpio_func_sel((gpio_num_t)pins[i], PIN_FUNC_GPIO);
@@ -214,7 +218,7 @@
     }
 
     // Clock
-      esp_rom_gpio_connect_out_signal(_cfg.pin_wr,  LCD_PCLK_IDX, _cfg.invert_pclk, false);
+      esp_rom_gpio_connect_out_signal(_cfg.pin_wr,  LCD_PCLK_PAD_OUT_IDX, _cfg.invert_pclk, false);
 	  
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
 	  // https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA/issues/803
@@ -287,9 +291,10 @@
     esp_rom_delay_us(1000);
      
     LCD_CAM.lcd_user.lcd_dout        = 1; // Enable data out
-    LCD_CAM.lcd_user.lcd_update      = 1; // Update registers
+    LCD_CAM.lcd_user.lcd_update_reg  = 1; // Update registers
     LCD_CAM.lcd_misc.lcd_afifo_reset = 1; // Reset LCD TX FIFO
 
+    }       
 
     return true; // no return val = illegal instruction
  }
@@ -423,7 +428,7 @@
   {
 
         LCD_CAM.lcd_user.lcd_reset = 1;        // Trigger LCD DMA transfer
-        LCD_CAM.lcd_user.lcd_update = 1;        // Trigger LCD DMA transfer
+        LCD_CAM.lcd_user.lcd_update_reg = 1;        // Trigger LCD DMA transfer
 
         gdma_stop(dma_chan);   
         

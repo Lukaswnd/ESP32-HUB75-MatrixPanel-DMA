@@ -25,9 +25,9 @@
 
 #pragma once
 #include <sdkconfig.h>
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+#ifdef CONFIG_IDF_TARGET_ESP32P4
 
-#include <sdkconfig.h>
+
 #include <esp_lcd_panel_io.h>
 
 //#include <freertos/portmacro.h>
@@ -71,11 +71,8 @@
 #include <esp_heap_caps_init.h>
 
 
-#if __has_include (<esp_private/periph_ctrl.h>)
- #include <esp_private/periph_ctrl.h>
-#else
- #include <driver/periph_ctrl.h>
-#endif
+#include <esp_private/periph_ctrl.h>
+
 
 #if __has_include(<esp_arduino_version.h>)
  #include <esp_arduino_version.h>
