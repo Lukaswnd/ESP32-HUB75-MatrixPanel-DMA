@@ -28,6 +28,7 @@
 #include "freertos/idf_additions.h"
 #include "soc/soc_caps.h"
 #include "soc/gdma_channel.h"
+#include "soc/io_mux_reg.h"
 #include "soc/parlio_periph.h"
 #include "hal/parlio_types.h"
 #include "hal/parlio_hal.h"
@@ -100,6 +101,8 @@
 #define PARLIO_RCC_ATOMIC()
 #endif  // SOC_RCC_IS_INDEPENDENT
 
+#define PARLIO_PM_LOCK_NAME_LEN_MAX 16
+
 ///!< Logging settings
 #define TAG "parlio"
 
@@ -159,9 +162,11 @@ typedef struct {
 
 // original function pointer type definition
 
+
 typedef esp_err_t (*parlio_tx_bs_enable_fn_t)(parlio_tx_unit_handle_t tx_unit, parlio_tx_trans_desc_t *t);
 typedef esp_err_t (*parlio_tx_bs_disable_fn_t)(parlio_tx_unit_handle_t tx_unit);
 
+//log the version of C at compile time
 typedef struct parlio_tx_unit_t {
     struct parlio_unit_t base; // base unit
     size_t data_width;     // data width
@@ -170,12 +175,13 @@ typedef struct parlio_tx_unit_t {
     gpio_num_t clk_out_gpio_num; // output clock GPIO number
     gpio_num_t clk_in_gpio_num;  // input clock GPIO number
     intr_handle_t intr;    // allocated interrupt handle
+    esp_pm_lock_handle_t pm_lock;   // power management lock
     gdma_channel_handle_t dma_chan; // DMA channel
     gdma_link_list_handle_t dma_link[PARLIO_DMA_LINK_NUM]; // DMA link list handle
     size_t int_mem_align; // Alignment for internal memory
     size_t ext_mem_align; // Alignment for external memory
 #if CONFIG_PM_ENABLE
-    esp_pm_lock_handle_t pm_lock;   // power management lock
+    char pm_lock_name[PARLIO_PM_LOCK_NAME_LEN_MAX]; // pm lock name
 #endif
     portMUX_TYPE spinlock;     // prevent resource accessing by user and interrupt concurrently
     uint32_t out_clk_freq_hz;  // output clock frequency
@@ -186,8 +192,8 @@ typedef struct parlio_tx_unit_t {
     QueueHandle_t trans_queues[PARLIO_TX_QUEUE_MAX]; // transaction queues
     parlio_tx_trans_desc_t *cur_trans; // points to current transaction
     uint32_t idle_value_mask;          // mask of idle value
-    _Atomic parlio_tx_fsm_t fsm;       // Driver FSM state
-    _Atomic bool buffer_need_switch;   // whether the buffer need to be switched
+    parlio_tx_fsm_t fsm;       // Driver FSM state
+    bool buffer_need_switch;   // whether the buffer need to be switched
     parlio_tx_done_callback_t on_trans_done; // callback function when the transmission is done
     parlio_tx_buffer_switched_callback_t on_buffer_switched; // callback function when the buffer is switched in loop transmission
     void *user_data;                   // user data passed to the callback function

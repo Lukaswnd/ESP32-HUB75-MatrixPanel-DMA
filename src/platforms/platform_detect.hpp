@@ -65,6 +65,8 @@ Modified heavily for the ESP32 HUB75 DMA library by:
 
   #pragma message "Compiling for ESP32-P4 with PARLIO support"
   #include "esp32p4/parlio_tx_parallel16.hpp"
+  
+  #include "esp32p4/esp32p4-default-pins.hpp"
   // ESP32-P4 doesn't need default pins as PARLIO is flexible
 
  #elif defined (CONFIG_IDF_TARGET_ESP32) || defined(ESP32)

@@ -2,6 +2,9 @@
 
 // Avoid and QSPI pins
 
+#include "sdkconfig.h"
+#if defined (CONFIG_IDF_TARGET_ESP32S3)
+
 #define R1_PIN_DEFAULT 4
 #define G1_PIN_DEFAULT 5
 #define B1_PIN_DEFAULT 6
@@ -16,3 +19,5 @@
 #define LAT_PIN_DEFAULT 40
 #define OE_PIN_DEFAULT  2
 #define CLK_PIN_DEFAULT 41
+
+#endif

@@ -16,6 +16,12 @@
 
 #pragma once
 
+
+#include "sdkconfig.h"
+#if defined (CONFIG_IDF_TARGET_ESP32P4)
+
+
+#include "soc/soc_caps.h"
 #if SOC_PARLIO_SUPPORTED
 
 #include <sdkconfig.h>
@@ -28,20 +34,18 @@
 #include <esp_heap_caps.h>
 #include <esp_heap_caps_init.h>
 
-#if __has_include(<esp_private/periph_ctrl.h>)
- #include <esp_private/periph_ctrl.h>
-#else
- #include <driver/periph_ctrl.h>
-#endif
 
 #if __has_include(<esp_arduino_version.h>)
  #include <esp_arduino_version.h>
 #endif
 
 #include "driver/parlio_tx.h"
+//#include "esp_private/parlio_private.h"
+
 #include "parlio_priv.h"        // Local copy of parlio private headers
 #include "esp_private/gdma.h"
-#include "gdma_link.h"          // Local copy of GDMA link API
+#include "esp_private/gdma_link.h"
+
 
 // Define alignment if not available from parlio_priv.h
 #ifndef PARLIO_DMA_DESC_ALIGNMENT
@@ -149,3 +153,5 @@ private:
 };
 
 #endif // SOC_PARLIO_SUPPORTED
+
+#endif

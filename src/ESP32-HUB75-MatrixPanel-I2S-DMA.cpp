@@ -35,6 +35,34 @@
 bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
 {
   
+    //
+  //    Setup DMA and Output to GPIO
+  //
+  auto bus_cfg = dma_bus.config(); // バス設定用の構造体を取得します。
+
+  bus_cfg.bus_freq    = m_cfg.i2sspeed;
+  bus_cfg.pin_wr      = m_cfg.gpio.clk;
+  bus_cfg.invert_pclk = m_cfg.clkphase;
+
+  bus_cfg.pin_d0 = m_cfg.gpio.r1;
+  bus_cfg.pin_d1 = m_cfg.gpio.g1;
+  bus_cfg.pin_d2 = m_cfg.gpio.b1;
+  bus_cfg.pin_d3 = m_cfg.gpio.r2;
+  bus_cfg.pin_d4 = m_cfg.gpio.g2;
+  bus_cfg.pin_d5 = m_cfg.gpio.b2;
+  bus_cfg.pin_d6 = m_cfg.gpio.lat;
+  bus_cfg.pin_d7 = m_cfg.gpio.oe;
+  bus_cfg.pin_d8 = m_cfg.gpio.a;
+  bus_cfg.pin_d9 = m_cfg.gpio.b;
+  bus_cfg.pin_d10 = m_cfg.gpio.c;
+  bus_cfg.pin_d11 = m_cfg.gpio.d;
+  bus_cfg.pin_d12 = m_cfg.gpio.e;
+  bus_cfg.pin_d13 = -1;
+  bus_cfg.pin_d14 = -1;
+  bus_cfg.pin_d15 = -1;
+
+  dma_bus.config(bus_cfg);
+
   /***
    * Step 0: Allocate basic DMA framebuffer memory for the data we send out in parallel to the HUB75 panel.
    *         Colour depth is the only consideration.
@@ -270,33 +298,7 @@ bool MatrixPanel_I2S_DMA::setupDMA(const HUB75_I2S_CFG &_cfg)
   fb = &frame_buffer[0];
   
 
-  //
-  //    Setup DMA and Output to GPIO
-  //
-  auto bus_cfg = dma_bus.config(); // バス設定用の構造体を取得します。
 
-  bus_cfg.bus_freq    = m_cfg.i2sspeed;
-  bus_cfg.pin_wr      = m_cfg.gpio.clk;
-  bus_cfg.invert_pclk = m_cfg.clkphase;
-
-  bus_cfg.pin_d0 = m_cfg.gpio.r1;
-  bus_cfg.pin_d1 = m_cfg.gpio.g1;
-  bus_cfg.pin_d2 = m_cfg.gpio.b1;
-  bus_cfg.pin_d3 = m_cfg.gpio.r2;
-  bus_cfg.pin_d4 = m_cfg.gpio.g2;
-  bus_cfg.pin_d5 = m_cfg.gpio.b2;
-  bus_cfg.pin_d6 = m_cfg.gpio.lat;
-  bus_cfg.pin_d7 = m_cfg.gpio.oe;
-  bus_cfg.pin_d8 = m_cfg.gpio.a;
-  bus_cfg.pin_d9 = m_cfg.gpio.b;
-  bus_cfg.pin_d10 = m_cfg.gpio.c;
-  bus_cfg.pin_d11 = m_cfg.gpio.d;
-  bus_cfg.pin_d12 = m_cfg.gpio.e;
-  bus_cfg.pin_d13 = -1;
-  bus_cfg.pin_d14 = -1;
-  bus_cfg.pin_d15 = -1;
-
-  dma_bus.config(bus_cfg);
 
   ESP_LOGI("I2S-DMA", "DMA setup completed");
   

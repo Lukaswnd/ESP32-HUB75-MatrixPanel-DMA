@@ -11,6 +11,11 @@
  * 4. Full compatibility with ESP32-S3 HUB75 library architecture
  */
 
+#include "sdkconfig.h"
+#if defined (CONFIG_IDF_TARGET_ESP32P4)
+
+
+#include "parlio_tx_parallel16.hpp"
 #if SOC_PARLIO_SUPPORTED
 
 #pragma message "Compiling for ESP32-P4 with PARLIO support"
@@ -19,18 +24,18 @@
    #include <Arduino.h>
 #endif
 
-#include "parlio_tx_parallel16.hpp"
+
 #include "esp_attr.h"
 #include "esp_idf_version.h"
 #include "hal/parlio_ll.h"
-#include "parlio_priv.h"     // Local copy of parlio private headers
-#include "gdma_link.h"       // Local copy of GDMA link API
+//#include "parlio_priv.h"     // Local copy of parlio private headers
+//#include "gdma_link.h"       // Local copy of GDMA link API
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)		
   #include "esp_private/gpio.h"
 #endif
 
-static const char* TAG = "P4_PARLIO_BCM";
+//static const char* TAG = "P4_PARLIO_BCM";
 
 // Callback function prototypes
 static IRAM_ATTR bool parlio_tx_buffer_switched_callback(parlio_tx_unit_handle_t tx_unit, 
@@ -49,11 +54,8 @@ static volatile bool transmission_complete = false;
 void Bus_Parallel16::config(const config_t& cfg)
 {
     _cfg = cfg;
-}
 
-bool Bus_Parallel16::init(void)
-{
-    ESP_LOGI(TAG, "Initializing ESP32-P4 PARLIO TX unit");
+        ESP_LOGI(TAG, "Initializing ESP32-P4 PARLIO TX unit");
     
     // Fixed 16-bit data width for HUB75 compatibility
     const size_t data_width = 16;
@@ -63,17 +65,17 @@ bool Bus_Parallel16::init(void)
     // Configure PARLIO TX unit
     parlio_tx_unit_config_t parlio_config = {
         .clk_src = PARLIO_CLK_SRC_DEFAULT,
-        .clk_in_gpio_num = -1,  // Use internal clock
+        .clk_in_gpio_num = GPIO_NUM_NC,  // Use internal clock
         .input_clk_src_freq_hz = 0,  // Not used with internal clock
         .output_clk_freq_hz = _cfg.bus_freq,
         .data_width = data_width,
-        .data_gpio_nums = {-1}, // Will be set below
-        .clk_out_gpio_num = _cfg.pin_wr,
-        .valid_gpio_num = -1,  // No valid signal
+        .data_gpio_nums = {GPIO_NUM_NC}, // Will be set below
+        .clk_out_gpio_num = (gpio_num_t)_cfg.pin_wr,
+        .valid_gpio_num = GPIO_NUM_NC,  // No valid signal
         .valid_start_delay = 0,
         .valid_stop_delay = 0,
         .trans_queue_depth = 4,
-        .max_transfer_size = 64 * 1024,  // PARLIO will create DMA link lists internally for this size
+        .max_transfer_size = 128*64*2,  // PARLIO will create DMA link lists internally for this size
         .dma_burst_size = 16,
         .sample_edge = _cfg.invert_pclk ? PARLIO_SAMPLE_EDGE_NEG : PARLIO_SAMPLE_EDGE_POS,
         .bit_pack_order = PARLIO_BIT_PACK_ORDER_LSB,
@@ -86,16 +88,17 @@ bool Bus_Parallel16::init(void)
     
     // Copy data pin configuration - all 16 pins for HUB75
     for (size_t i = 0; i < 16; i++) {
-        parlio_config.data_gpio_nums[i] = _cfg.pin_data[i];
+        parlio_config.data_gpio_nums[i] = (gpio_num_t)_cfg.pin_data[i];
     }
     
     // Create PARLIO TX unit
     esp_err_t ret = parlio_new_tx_unit(&parlio_config, &_parlio_unit);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create PARLIO TX unit: %s", esp_err_to_name(ret));
-        return false;
+        return;
     }
-    
+    ESP_LOGI(TAG, "created PARLIO TX unit");
+
     // Setup transmit configuration
     _transmit_config.idle_value = 0x00;
     _transmit_config.bitscrambler_program = NULL;
@@ -113,7 +116,7 @@ bool Bus_Parallel16::init(void)
         ESP_LOGE(TAG, "Failed to register callbacks: %s", esp_err_to_name(ret));
         parlio_del_tx_unit(_parlio_unit);
         _parlio_unit = nullptr;
-        return false;
+        return;
     }
     
     // Enable the PARLIO TX unit
@@ -122,9 +125,15 @@ bool Bus_Parallel16::init(void)
         ESP_LOGE(TAG, "Failed to enable PARLIO TX unit: %s", esp_err_to_name(ret));
         parlio_del_tx_unit(_parlio_unit);
         _parlio_unit = nullptr;
-        return false;
+        return;
     }
-    
+    static uint8_t data[128*64*2] = {0};
+    parlio_tx_unit_transmit(_parlio_unit, data,128*64*2*8, &_transmit_config);
+}
+
+bool Bus_Parallel16::init(void)
+{
+
     _is_transmitting = false;
     _current_buffer_id = 0;
     
@@ -198,13 +207,14 @@ bool Bus_Parallel16::allocate_dma_desc_memory(uint16_t num_descriptors)
     // Get PARLIO's internal GDMA channel (accessing private structure)
     parlio_tx_unit_t* tx_unit = (parlio_tx_unit_t*)_parlio_unit;
     _gdma_channel = tx_unit->dma_chan;
+    ESP_LOGI(TAG, "GDMA Channel address %X", _gdma_channel);
     
     // Create GDMA link lists for manual descriptor management
     gdma_link_list_config_t link_config = {
         .num_items = num_descriptors,
         .flags = {
+            .items_in_ext_mem = false,
             .check_owner = true,
-            .items_in_ext_mem = false
         }
     };
     
@@ -286,7 +296,7 @@ void Bus_Parallel16::create_dma_desc_link(void *data, size_t size, bool dmadesc_
 void Bus_Parallel16::dma_transfer_start()
 {
     if (!_parlio_unit || !_gdma_channel || !_gdma_link_list_a) {
-        ESP_LOGE(TAG, "PARLIO unit, GDMA channel, or link list not initialized");
+        ESP_LOGE(TAG, "PARLIO unit, GDMA channel, or link list not initialized %X %X %X", _parlio_unit, _gdma_channel, _gdma_link_list_a);
         return;
     }
     
@@ -299,7 +309,7 @@ void Bus_Parallel16::dma_transfer_start()
     }
     
     // Connect the link list to the GDMA channel
-    esp_err_t ret = gdma_channel_connect_link_list(_gdma_channel, active_list);
+    esp_err_t ret = ESP_OK;//gdma_channel_connect_link_list(_gdma_channel, active_list);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to connect link list to GDMA channel: %s", esp_err_to_name(ret));
         return;
@@ -350,7 +360,7 @@ void Bus_Parallel16::flip_dma_output_buffer(int back_buffer_id)
         gdma_link_list_handle_t target_list = (back_buffer_id == 0) ? _gdma_link_list_a : _gdma_link_list_b;
         
         // Connect new link list and restart
-        esp_err_t ret = gdma_channel_connect_link_list(_gdma_channel, target_list);
+        esp_err_t ret = ESP_OK;//gdma_channel_connect_link_list(_gdma_channel, target_list);
         if (ret == ESP_OK) {
             ret = gdma_start(_gdma_channel, gdma_link_get_head_addr(target_list));
         }
@@ -409,3 +419,5 @@ static IRAM_ATTR bool parlio_tx_done_callback(parlio_tx_unit_handle_t tx_unit,
 }
 
 #endif // SOC_PARLIO_SUPPORTED
+
+#endif

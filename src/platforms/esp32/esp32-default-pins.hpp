@@ -1,5 +1,8 @@
 #pragma once
 
+#include "sdkconfig.h"
+#if defined (CONFIG_IDF_TARGET_ESP32)
+
 #define R1_PIN_DEFAULT  25
 #define G1_PIN_DEFAULT  26
 #define B1_PIN_DEFAULT  27
@@ -16,3 +19,5 @@
 #define LAT_PIN_DEFAULT 4
 #define OE_PIN_DEFAULT  15
 #define CLK_PIN_DEFAULT 16
+
+#endif

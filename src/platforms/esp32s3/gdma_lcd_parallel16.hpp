@@ -25,9 +25,11 @@
 
 #pragma once
 
+#include "sdkconfig.h"
+#if defined (CONFIG_IDF_TARGET_ESP32S3)
+
 #if __has_include (<hal/lcd_ll.h>)
 
-#include <sdkconfig.h>
 #include <esp_lcd_panel_io.h>
 
 //#include <freertos/portmacro.h>
@@ -172,5 +174,7 @@
 
   };
 
+
+#endif
 
 #endif
