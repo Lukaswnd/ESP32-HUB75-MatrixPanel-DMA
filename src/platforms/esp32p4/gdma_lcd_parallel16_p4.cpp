@@ -20,70 +20,53 @@
 #include <sdkconfig.h>
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 
-  #pragma message "Compiling gdma lcd for ESP32-P4"
+#pragma message "Compiling gdma lcd for ESP32-P4"
 
-  #ifdef ARDUINO_ARCH_ESP32
-     #include <Arduino.h>
-  #endif
+#ifdef ARDUINO_ARCH_ESP32
+    #include <Arduino.h>
+#endif
 
-  #include "gdma_lcd_parallel16_p4.hpp"
-  #include "esp_attr.h"
-  #include "esp_idf_version.h"
+#include "gdma_lcd_parallel16_p4.hpp"
 
-  #include "hal/lcd_ll.h"
+#include "esp_idf_version.h"
+
+
+#if __has_include(<esp_arduino_version.h>)
+ #include <esp_arduino_version.h>
+#endif
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)		
   #include "esp_private/gpio.h"
 #endif  
 
-/*
-  DRAM_ATTR volatile bool previousBufferFree = true;
- 
-  // End-of-DMA-transfer callback
-  IRAM_ATTR bool gdma_on_trans_eof_callback(gdma_channel_handle_t dma_chan,
-                                    gdma_event_data_t *event_data, void *user_data) {
-                                        
-  // This DMA callback seems to trigger a moment before the last data has
-  // issued (buffering between DMA & LCD peripheral?), so pause a moment
-  // before stopping LCD data out. The ideal delay may depend on the LCD
-  // clock rate...this one was determined empirically by monitoring on a
-  // logic analyzer. YMMV.
-    esp_rom_delay_us(100);        
-  // The LCD peripheral stops transmitting at the end of the DMA xfer, but
-  // clear the lcd_start flag anyway -- we poll it in loop() to decide when
-  // the transfer has finished, and the same flag is set later to trigger
-  // the next transfer.
 
-    //LCD_CAM.lcd_user.lcd_start = 0;
-    
-    previousBufferFree = true;
-    
-    return true;
-  }  
-*/  
+#include <esp_err.h>
+#include <esp_log.h>
 
-  lcd_cam_dev_t* getDev()
-  {
-    return &LCD_CAM;
-  }
+#include "soc/parl_io_struct.h"
 
-  // ------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------
 
-  void Bus_Parallel16::config(const config_t& cfg)
-  {
-    _cfg = cfg;
-    //auto port = cfg.port;
-    _dev = getDev();
-  }
+Bus_Parallel16::Bus_Parallel16(){
+
+}
+
+void Bus_Parallel16::config(const config_t& cfg)
+{
+  _cfg = cfg;
+  //auto port = cfg.port;
+}
 
 
  //https://github.com/adafruit/Adafruit_Protomatter/blob/master/src/arch/esp32-s3.h
  bool Bus_Parallel16::init(void)
  {
+
+    #if 0
     ///dmabuff2 = (uint16_t*)heap_caps_malloc(sizeof(uint16_t) * 64*32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
 
-    
+
                                            
                                                                                                       
       
@@ -311,6 +294,7 @@
     LCD_CAM.lcd_user.lcd_dout        = 1; // Enable data out
     LCD_CAM.lcd_user.lcd_update_reg  = 1; // Update registers
     LCD_CAM.lcd_misc.lcd_afifo_reset = 1; // Reset LCD TX FIFO      
+    #endif
 
     return true; // no return val = illegal instruction
  }
@@ -318,11 +302,9 @@
 
   void Bus_Parallel16::release(void)
   {
-    if (_i80_bus)
-    {
-      esp_lcd_del_i80_bus(_i80_bus);
-      _i80_bus = nullptr;
-    }
+    parlio_tx_unit_disable(tx_unit);
+    parlio_del_tx_unit(tx_unit);
+    tx_unit = nullptr;
     if (_dmadesc_a)
     {
       heap_caps_free(_dmadesc_a);
@@ -436,15 +418,14 @@
   {
     gdma_start(dma_chan, (intptr_t)&_dmadesc_a[0]); // Start DMA w/updated descriptor(s)
     esp_rom_delay_us(100);              // Must 'bake' a moment before...
-    LCD_CAM.lcd_user.lcd_start = 1;        // Trigger LCD DMA transfer
+    //PARL_IO.tx_start_cfg.tx_start = 1;
     
   } // end 
 
   void Bus_Parallel16::dma_transfer_stop()
   {
 
-        LCD_CAM.lcd_user.lcd_reset = 1;        // Trigger LCD DMA transfer
-        LCD_CAM.lcd_user.lcd_update_reg = 1;        // Trigger LCD DMA transfer
+        //PARL_IO.fifo_cfg.tx_fifo_srst = 1;
 
         gdma_stop(dma_chan);   
         
@@ -472,4 +453,4 @@
   } // end flip
 
 
-#endif
+#endif // defined(CONFIG_IDF_TARGET_ESP32P4)

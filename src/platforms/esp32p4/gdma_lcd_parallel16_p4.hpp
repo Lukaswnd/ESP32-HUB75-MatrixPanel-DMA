@@ -28,13 +28,16 @@
 #ifdef CONFIG_IDF_TARGET_ESP32P4
 
 
-#include <esp_lcd_panel_io.h>
 
+#include "driver/parlio_tx.h"
+#include <esp_private/gdma.h>
+#include <hal/dma_types.h>
+
+/*
 //#include <freertos/portmacro.h>
 #include <esp_intr_alloc.h>
 
-#include <esp_err.h>
-#include <esp_log.h>
+
 
 #include <driver/gpio.h>
 #include <soc/gpio_sig_map.h>
@@ -50,22 +53,16 @@
 
 #include <stdint.h>
 
-/*
-#if (ESP_IDF_VERSION_MAJOR == 5)
-#include <esp_private/periph_ctrl.h>
-#else
-#include <driver/periph_ctrl.h>
-#endif
-*/
-
-#include <esp_private/gdma.h>
 #include <esp_rom_gpio.h>
-#include <hal/dma_types.h>
 #include <hal/gpio_hal.h>
 
-#include <hal/lcd_ll.h>
-#include <soc/lcd_cam_reg.h>
-#include <soc/lcd_cam_struct.h>
+#include <hal/parlio_hal.h>
+#include <hal/parlio_ll.h>
+#include <hal/parlio_types.h>
+#include <soc/parlio_periph.h>
+#include <soc/parl_io_reg.h>
+#include <soc/parl_io_struct.h>
+
 
 #include <esp_heap_caps.h>
 #include <esp_heap_caps_init.h>
@@ -73,10 +70,8 @@
 
 #include <esp_private/periph_ctrl.h>
 
+*/
 
-#if __has_include(<esp_arduino_version.h>)
- #include <esp_arduino_version.h>
-#endif
 
 #define DMA_MAX (4096-4)
 
@@ -89,10 +84,6 @@
   class Bus_Parallel16 
   {
   public:
-    Bus_Parallel16()
-    {
-
-    }
 
     struct config_t
     {
@@ -151,7 +142,9 @@
 
     config_t _cfg;
 
-    volatile lcd_cam_dev_t* _dev;   
+    parlio_tx_unit_config_t parlio_config;
+    parlio_tx_unit_handle_t tx_unit = NULL;
+    parlio_transmit_config_t transmit_config; 
     gdma_channel_handle_t dma_chan; 
 
     uint32_t _dmadesc_count  = 0;   // number of dma decriptors
@@ -163,9 +156,6 @@
     HUB75_DMA_DESCRIPTOR_T* _dmadesc_b = nullptr;    
 
     bool    _double_dma_buffer = false;
-
-    esp_lcd_i80_bus_handle_t _i80_bus = nullptr;
-
 
   };
 
