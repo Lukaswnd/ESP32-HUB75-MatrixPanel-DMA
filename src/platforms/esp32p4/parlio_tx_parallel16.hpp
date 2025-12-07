@@ -71,7 +71,10 @@ public:
     {
         _parlio_unit = nullptr;
         _gdma_link_list_a = nullptr;
+        _gdma_link_list_a_loop = nullptr;
         _gdma_link_list_b = nullptr;
+        _gdma_link_list_b_loop = nullptr;
+        _parlio_dma_link_default = nullptr;
         _gdma_channel = nullptr;
         _double_dma_buffer = false;
         _dmadesc_count = 0;
@@ -133,8 +136,19 @@ private:
     parlio_tx_unit_handle_t _parlio_unit;
     
     // BCM-compatible DMA descriptor management using GDMA Link API
+    // We have 4 link lists total:
+    // - _gdma_link_list_a (buffer A, first list)
+    // - _gdma_link_list_a_loop (buffer A, second list for looping)
+    // - _gdma_link_list_b (buffer B, first list)
+    // - _gdma_link_list_b_loop (buffer B, second list for looping)
     gdma_link_list_handle_t _gdma_link_list_a;
+    gdma_link_list_handle_t _gdma_link_list_a_loop;
     gdma_link_list_handle_t _gdma_link_list_b;
+    gdma_link_list_handle_t _gdma_link_list_b_loop;
+    
+    // PARLIO's internal DMA link lists (accessed but not owned by us)
+    gdma_link_list_handle_t _parlio_dma_link_default;
+    
     gdma_channel_handle_t _gdma_channel;
     
     // Descriptor tracking for HUB75 BCM compatibility
