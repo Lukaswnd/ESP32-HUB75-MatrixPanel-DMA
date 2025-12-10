@@ -1,699 +1,440 @@
-/*
- * ESP32-P4 Parallel TX Driver using PARLIO + Direct GDMA Link API
- * 
- * This implementation uses PARLIO for GPIO/clock management but accesses
- * the internal GDMA link lists directly for precise HUB75 BCM control.
- * 
- * KEY APPROACH:
- * 1. PARLIO sets up GPIO routing and clock generation
- * 2. We access PARLIO's internal GDMA channel and link lists
- * 3. Manual DMA descriptor management for BCM timing control
- * 4. Full compatibility with ESP32-S3 HUB75 library architecture
- */
-
-#include "sdkconfig.h"
-#if defined (CONFIG_IDF_TARGET_ESP32P4)
-
-
 #include "parlio_tx_parallel16.hpp"
-#if SOC_PARLIO_SUPPORTED
 
-#pragma message "Compiling for ESP32-P4 with PARLIO support"
+#ifdef CONFIG_IDF_TARGET_ESP32P4
+
+#pragma message "Compiling for ESP32-P4"
+
+//First implementation might have a lot of bugs, especially on deleting and reloading
+
+//major test setup:
+// ESP32-P4 4MB Flash (USB disabled)
+// 64x32 matrix (2 scanlines) P5
+// esp32P4_default_pins.hpp 
+// double_buffer = sometimes active, sometimes not - not much difference
+// clkphase = false, latch_blanking = 1, i2sspeed = 10Mhz, colordepth = 5
+// brightness = 15
+// I use my custom GFX library, so neither GFX Class nor AdafruitGFX, during testing I forced it to 50hz. more would case ghosting and artifacts
+// I'm to lazy to make a proper voltage supply, so lets just say - powersupply might be an issue 
+// I sodered the pins to the esp32P4 devkit, but used jumer wired to conned to a HUB75 Data cable 
+// which is plug into the hub 
+// I'm using custom arduino build, quite close to the 3.0.1 release, based on idf-5.1 - there might be problems when updating to idf 5.2
+
+//known bugs of this first implementation:
+// - doublebuffer might shift the first view colums
+// - when wriring to littlefs (maybe flash in general) flashing of the first lines, because the 
+//     restart is sceduled - seems like reading ha sno effect
+//     maybe the problem is the webserver which reveives the data
+// - there seems to be glowing of the fist line - might be power supply issue on my side
+// - BIG PROBLEM on 64x32 matrix (2 scanlines) the first 13x16 block flickers. Not the bottom half,
+//     just the top half, maybe pin related? - increases by higher gfx action, never goes to zero
+//     sometimer randomly stops fur multiple minutes
+// - due to a single core everything (I expierienced just a view, very little artifacts with all of
+//     them active at the same time: WiFi, AsyncWeserver, AsyncTCP, Filesystem, Serial, dns, mdns, sntp, custom GFX Task @ 50hz, berry-lang interpreter)
+//     can cause artifacts and flashing - the problem is that the 'dma-loop' has to be retriggered
+//     see gdma_on_trans_eof_callback, it may be a isr action, but still needs to reserve the core 
+//     for a view clocks
+
+
+// limitation of parlio interface
+// PARLIO_LL_TX_MAX_BITS_PER_FRAME = (PARLIO_LL_TX_MAX_BYTES_PER_FRAME * 8)
+// PARLIO_LL_TX_MAX_BYTES_PER_FRAME = 0xFFFF
+// the problem are not these 2 defines. In "soc/parl_io_struct.h" (esp32-arduino-libs\esp32P4\include\soc\esp32P4\include\soc\parl_io_struct.h)
+// there are only 16 bit for the number of bytes. I'm not sure, but I think this is the limiting factor. And I think
+// this struct links to registers for die parlio driver, so no software change possible -> maybe software change?
+// Max of 65535 bytes for matrix with 2 scan lines the following resulutions are theoretical max for pixeldepths
+//                              theory                         tested
+// pixeldepth 8:                              16x16             14x32            14*16*255 = 57120
+// pixeldepth 7:                     16x32    32x16             28x32            28*16*127 = 56896
+// pixeldepth 6:                     32x32    64x16             55x32            55*16*63  = 55440
+// pixeldepth 5:             32x64   64x32   128x16            102x32           102*16*31  = 50592
+// pixeldepth 4:             64x64  128x32   256x16            186x32           186*16*15  = 44640
+// pixeldepth 3:            128x64  256x32   512x16            341x32           341*16*7   = 38192
+// pixeldepth 2:   128x128  256x64  512x32  1024x16            682x32           682*16*2   = 32736
+//                                                                              I don't get it
 
 #ifdef ARDUINO_ARCH_ESP32
-   #include <Arduino.h>
+#include <Arduino.h>
 #endif
 
-#include <inttypes.h>
-
-#include "esp_attr.h"
-#include "esp_idf_version.h"
+#include "soc/parl_io_struct.h"
+#include "soc/parl_io_reg.h"
+#include "soc/parlio_periph.h"
+#include "hal/parlio_hal.h"
 #include "hal/parlio_ll.h"
-#include "hal/gdma_ll.h"
-//#include "parlio_priv.h"     // Local copy of parlio private headers
-//#include "gdma_link.h"       // Local copy of GDMA link API
+#include "hal/parlio_types.h"
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)		
-  #include "esp_private/gpio.h"
-#endif
-
-// Callback function prototypes
-static IRAM_ATTR bool parlio_tx_buffer_switched_callback(parlio_tx_unit_handle_t tx_unit, 
-                                                        const parlio_tx_buffer_switched_event_data_t *event_data, 
-                                                        void *user_data);
-
-static IRAM_ATTR bool parlio_tx_done_callback(parlio_tx_unit_handle_t tx_unit, 
-                                              const parlio_tx_done_event_data_t *event_data, 
-                                              void *user_data);
-
-// Static callback data
-static volatile bool transmission_complete = false;
+#include "esp_clk_tree.h"
+#include "esp_private/periph_ctrl.h"
+#include "esp_attr.h"
+#include "esp_rom_sys.h"
+#include "esp_rom_gpio.h"
+#include "driver/gpio.h"
+#include "esp_private/esp_clk_tree_common.h"
 
 
+DRAM_ATTR volatile bool previousBufferFree = true;
 
+// End-of-DMA-transfer callback
+IRAM_ATTR bool gdma_on_trans_eof_callback(gdma_channel_handle_t dma_chan,
+                                          gdma_event_data_t *event_data, void *user_data)
+{
+    //esp_rom_delay_us(100);
+    previousBufferFree = true;
 
+    //parlio_ll_tx_reset_fifo(&PARL_IO);
+//    parlio_ll_tx_reset_clock(&PARL_IO);
+    
+    //gdma_start(dma_chan, (intptr_t)&_dmadesc_a[0]);
+    //while (parlio_ll_tx_is_ready(&PARL_IO) == false);
+    //parlio_ll_tx_start(&PARL_IO, true);
+    //parlio_ll_tx_enable_clock(&PARL_IO, true);
 
-
-static const char* parlio_dir_to_str(parlio_dir_t dir) {
-    switch (dir) {
-        case PARLIO_DIR_TX: return "PARLIO_DIR_TX";
-        case PARLIO_DIR_RX: return "PARLIO_DIR_RX";
-        default: return "UNKNOWN_DIR";
-    }
+    return true;
 }
-
-static const char* tx_fsm_to_str(parlio_tx_fsm_t fsm) {
-    switch (fsm) {
-        case PARLIO_TX_FSM_INIT:   return "PARLIO_TX_FSM_INIT";
-        case PARLIO_TX_FSM_ENABLE: return "PARLIO_TX_FSM_ENABLE";
-        case PARLIO_TX_FSM_RUN:    return "PARLIO_TX_FSM_RUN";
-        case PARLIO_TX_FSM_WAIT:   return "PARLIO_TX_FSM_WAIT";
-        default: return "UNKNOWN_FSM";
-    }
-}
-
-static void dump_trans_desc(const parlio_tx_trans_desc_t* d, const char* prefix) {
-    if (!d) {
-        printf("%s<null>\n", prefix);
-        return;
-    }
-    printf("%s idle_value=0x%08" PRIx32 "\n", prefix, d->idle_value);
-    printf("%s payload=%p\n", prefix, d->payload);
-    printf("%s payload_bits=%zu\n", prefix, d->payload_bits);
-    printf("%s dma_link_idx=%d\n", prefix, d->dma_link_idx);
-    printf("%s bitscrambler_program=%p\n", prefix, d->bitscrambler_program);
-    printf("%s flags.loop_transmission=%d\n", prefix, (int)d->flags.loop_transmission);
-}
-
-void dump_parlio_tx_unit(const parlio_tx_unit_t* tx_unit) {
-    if (!tx_unit) {
-        printf("tx_unit is NULL\n");
-        return;
-    }
-
-    printf("=== parlio_tx_unit_t @ %p ===\n", (const void*)tx_unit);
-
-    // base
-    printf("base.unit_id=%d\n", tx_unit->base.unit_id);
-    printf("base.dir=%s (%d)\n", parlio_dir_to_str(tx_unit->base.dir), (int)tx_unit->base.dir);
-    printf("base.group=%p\n", (void*)tx_unit->base.group);
-    if (tx_unit->base.group) {
-        printf("  group.group_id=%d\n", tx_unit->base.group->group_id);
-        printf("  group.dma_align=%u\n", (unsigned)tx_unit->base.group->dma_align);
-    }
-
-    // pins & width
-    printf("data_width=%zu\n", tx_unit->data_width);
-    size_t cap = sizeof(tx_unit->data_gpio_nums) / sizeof(tx_unit->data_gpio_nums[0]);
-    printf("data_gpio_nums (capacity=%zu):\n", cap);
-    for (size_t i = 0; i < cap; ++i) {
-        printf("  data_gpio_nums[%zu]=%d%s\n", i, (int)tx_unit->data_gpio_nums[i],
-               (i < tx_unit->data_width) ? " (used)" : "");
-    }
-    printf("valid_gpio_num=%d\n", (int)tx_unit->valid_gpio_num);
-    printf("clk_out_gpio_num=%d\n", (int)tx_unit->clk_out_gpio_num);
-    printf("clk_in_gpio_num=%d\n", (int)tx_unit->clk_in_gpio_num);
-
-    // handles & DMA
-    printf("intr=%p\n", (void*)tx_unit->intr);
-    printf("pm_lock=%p\n", (void*)tx_unit->pm_lock);
-    printf("dma_chan=%p\n", (void*)tx_unit->dma_chan);
-    for (int i = 0; i < PARLIO_DMA_LINK_NUM; ++i) {
-        printf("dma_link[%d]=%p\n", i, (void*)tx_unit->dma_link[i]);
-    }
-
-    // memory alignment
-    printf("int_mem_align=%zu\n", tx_unit->int_mem_align);
-    printf("ext_mem_align=%zu\n", tx_unit->ext_mem_align);
-
-    // optional PM lock name
-    #if CONFIG_PM_ENABLE
-    printf("pm_lock_name=\"%s\"\n", tx_unit->pm_lock_name);
-    #endif
-
-    // control & state
-    printf("spinlock_addr=%p\n", (void*)&tx_unit->spinlock);
-    printf("out_clk_freq_hz=%" PRIu32 "\n", tx_unit->out_clk_freq_hz);
-    printf("clk_src=%d\n", (int)tx_unit->clk_src);
-    printf("max_transfer_bits=%zu\n", tx_unit->max_transfer_bits);
-    printf("queue_depth=%zu\n", tx_unit->queue_depth);
-    printf("num_trans_inflight=%zu\n", tx_unit->num_trans_inflight);
-    for (int q = 0; q < PARLIO_TX_QUEUE_MAX; ++q) {
-        printf("trans_queues[%d]=%p\n", q, (void*)tx_unit->trans_queues[q]);
-    }
-    printf("cur_trans=%p\n", (void*)tx_unit->cur_trans);
-    printf("idle_value_mask=0x%08" PRIx32 "\n", tx_unit->idle_value_mask);
-    printf("fsm=%s (%d)\n", tx_fsm_to_str(tx_unit->fsm), (int)tx_unit->fsm);
-    printf("buffer_need_switch=%s\n", tx_unit->buffer_need_switch ? "true" : "false");
-
-    // callbacks & scrambler
-    printf("on_trans_done=%p\n", (void*)tx_unit->on_trans_done);
-    printf("on_buffer_switched=%p\n", (void*)tx_unit->on_buffer_switched);
-    printf("user_data=%p\n", tx_unit->user_data);
-    printf("bs_handle=%p\n", (void*)tx_unit->bs_handle);
-    printf("bs_enable_fn=%p\n", (void*)tx_unit->bs_enable_fn);
-    printf("bs_disable_fn=%p\n", (void*)tx_unit->bs_disable_fn);
-
-    // current transaction (if any)
-    if (tx_unit->cur_trans) {
-        printf("-- current transaction --\n");
-        dump_trans_desc(tx_unit->cur_trans, "  ");
-    }
-
-    // trans_desc_pool (assumed length = queue_depth)
-    printf("-- trans_desc_pool (assumed length = queue_depth) --\n");
-    for (size_t i = 0; i < tx_unit->queue_depth; ++i) {
-        const parlio_tx_trans_desc_t* d = &tx_unit->trans_desc_pool[i];
-        printf("  pool[%zu] @ %p\n", i, (const void*)d);
-        dump_trans_desc(d, "    ");
-    }
-
-    printf("=== end of parlio_tx_unit_t ===\n");
-}
-
-
-
-
-
-
-
 
 // ------------------------------------------------------------------------------
 
-void Bus_Parallel16::config(const config_t& cfg)
+void Bus_Parallel16::config(const config_t &cfg)
 {
     _cfg = cfg;
 
-        ESP_LOGI("P4_PARLIO_BCM", "Initializing ESP32-P4 PARLIO TX unit");
-    
-    // Fixed 16-bit data width for HUB75 compatibility
-    const size_t data_width = 16;
-    
-    ESP_LOGI("P4_PARLIO_BCM", "Using 16-bit data width for HUB75");
-
-    // Configure PARLIO TX unit
-    parlio_tx_unit_config_t parlio_config = {
-        .clk_src = PARLIO_CLK_SRC_DEFAULT,
-        .clk_in_gpio_num = GPIO_NUM_NC,  // Use internal clock
-        .input_clk_src_freq_hz = 0,  // Not used with internal clock
-        .output_clk_freq_hz = _cfg.bus_freq,
-        .data_width = data_width,
-        .data_gpio_nums = {GPIO_NUM_NC}, // Will be set below
-        .clk_out_gpio_num = (gpio_num_t)_cfg.pin_wr,
-        .valid_gpio_num = GPIO_NUM_NC,  // No valid signal
-        .valid_start_delay = 0,
-        .valid_stop_delay = 0,
-        .trans_queue_depth = 4,
-        .max_transfer_size = 128*64*2,  // PARLIO will create DMA link lists internally for this size
-        .dma_burst_size = 16,
-        .sample_edge = _cfg.invert_pclk ? PARLIO_SAMPLE_EDGE_NEG : PARLIO_SAMPLE_EDGE_POS,
-        .bit_pack_order = PARLIO_BIT_PACK_ORDER_LSB,
-        .flags = {
-            .clk_gate_en = 0,
-            .allow_pd = 0,
-            .invert_valid_out = 0
-        }
-    };
-    
-    // Copy data pin configuration - all 16 pins for HUB75
-    for (size_t i = 0; i < 16; i++) {
-        parlio_config.data_gpio_nums[i] = (gpio_num_t)_cfg.pin_data[i];
-    }
-    
-    // Create PARLIO TX unit
-    esp_err_t ret = parlio_new_tx_unit(&parlio_config, &_parlio_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to create PARLIO TX unit: %s", esp_err_to_name(ret));
-        return;
-    }
-    ESP_LOGI("P4_PARLIO_BCM", "created PARLIO TX unit");
-
-    // Setup transmit configuration
-    _transmit_config.idle_value = 0x00;
-    _transmit_config.bitscrambler_program = NULL;
-    _transmit_config.flags.queue_nonblocking = 0;
-    _transmit_config.flags.loop_transmission = 1; // Enable loop transmission for continuous operation
-    
-    // Register event callbacks
-    parlio_tx_event_callbacks_t callbacks = {
-        .on_trans_done = parlio_tx_done_callback,
-        .on_buffer_switched = parlio_tx_buffer_switched_callback
-    };
-    
-    ret = parlio_tx_unit_register_event_callbacks(_parlio_unit, &callbacks, this);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to register callbacks: %s", esp_err_to_name(ret));
-        parlio_del_tx_unit(_parlio_unit);
-        _parlio_unit = nullptr;
-        return;
-    }
-    
-    // Enable the PARLIO TX unit
-    ret = parlio_tx_unit_enable(_parlio_unit);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to enable PARLIO TX unit: %s", esp_err_to_name(ret));
-        parlio_del_tx_unit(_parlio_unit);
-        _parlio_unit = nullptr;
-        return;
-    }
-    static uint8_t data[128*64*2] = {0};
-    parlio_tx_unit_transmit(_parlio_unit, data,128*64*2*8, &_transmit_config);
 }
 
 bool Bus_Parallel16::init(void)
 {
+    ESP_LOGI("ESP32-P4", "Performing DMA bus init() for ESP-P4");
 
-    _is_transmitting = false;
-    _current_buffer_id = 0;
+    // Following ESP-IDF official initialization sequence from parlio_new_tx_unit()
+    printf("__A__\n");
     
-    ESP_LOGI("P4_PARLIO_BCM", "PARLIO TX unit initialized successfully");
-    return true;
+    parlio_clock_source_t clk_src = (parlio_clock_source_t)PARLIO_CLK_SRC_DEFAULT;
+    esp_err_t err = esp_clk_tree_enable_src((soc_module_clk_t)clk_src, true);
+
+    printf("__B__\n");
+    uint32_t periph_src_clk_hz = 0;
+    esp_clk_tree_src_get_freq_hz((soc_module_clk_t)clk_src, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &periph_src_clk_hz);
+
+    hal_utils_clk_div_t clk_div = {};
+    hal_utils_clk_info_t clk_info = {
+        .src_freq_hz = periph_src_clk_hz,
+        .exp_freq_hz = _cfg.bus_freq,
+        .max_integ = PARLIO_LL_TX_MAX_CLK_INT_DIV,
+        .min_integ = 1,
+        .round_opt = HAL_DIV_ROUND,
+    };
+
+    #if PARLIO_LL_TX_MAX_CLK_FRACT_DIV
+        printf("__C__\n");
+        clk_info.max_fract = PARLIO_LL_TX_MAX_CLK_FRACT_DIV;
+        _cfg.bus_freq = hal_utils_calc_clk_div_frac_accurate(&clk_info, &clk_div);
+    #else
+        printf("__D__\n");
+        _cfg.bus_freq = hal_utils_calc_clk_div_integer(&clk_info, &clk_div.integer);
+    #endif
+
+    
+    printf("__E__\n");
+
+    PERIPH_RCC_ATOMIC() {
+        printf("__F__\n");
+        // turn on the tx module clock to sync the clock divider configuration because of the CDC (Cross Domain Crossing)
+        parlio_ll_tx_enable_clock(&PARL_IO, true);
+        parlio_ll_tx_set_clock_source(&PARL_IO, clk_src);
+        // set clock division
+        parlio_ll_tx_set_clock_div(&PARL_IO, &clk_div);
+    }
+
+    // STEP 1: Enable peripheral bus clock and reset (like parlio_acquire_group_handle)
+    printf("__G__\n");
+    PERIPH_RCC_ATOMIC(){
+        parlio_ll_enable_bus_clock(0, true);  // group_id = 0 for PARLIO
+        parlio_ll_reset_register(0);
+    }
+    printf("__H__\n");
+    
+    // STEP 2: Enable clock tree source (CRITICAL - was missing!)
+
+    if (err != ESP_OK) {
+        ESP_LOGE("P4", "Failed to enable clock source: %d", err);
+        return false;
+    }
+    printf("__I__\n");
+    
+
+    ESP_LOGI("P4", "Clock divider is %d %d %d", (int)clk_div.integer, clk_div.numerator, clk_div.denominator);
+    ESP_LOGD("P4", "Resulting output clock frequency: %d Mhz", (int)(160000000L /  _cfg.bus_freq));
+
+
+    // Allocate DMA channel and connect it to the LCD peripheral
+    static gdma_channel_alloc_config_t dma_chan_config = {
+        .sibling_chan = NULL,
+        .direction = GDMA_CHANNEL_DIRECTION_TX,
+        .flags = {
+            .reserve_sibling = 0}};
+    gdma_new_axi_channel(&dma_chan_config, &dma_chan);
+    gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_PARLIO, 0));
+    static gdma_strategy_config_t strategy_config = {
+        .owner_check = false,
+        .auto_update_desc = false};
+    gdma_apply_strategy(dma_chan, &strategy_config);
+    printf("__L__\n");
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    gdma_transfer_config_t transfer_config = {
+#ifdef SPIRAM_DMA_BUFFER
+      .max_data_burst_size = 64,
+      .access_ext_mem = true
+#else
+      .max_data_burst_size = 32,
+      .access_ext_mem = false
+#endif
+    };
+    gdma_config_transfer(dma_chan, &transfer_config);
+#else
+    gdma_transfer_ability_t ability = {
+        .sram_trans_align = 32,
+        .psram_trans_align = 64,
+    };
+    gdma_set_transfer_ability(dma_chan, &ability);
+#endif
+
+    printf("__M__\n");
+    // Enable DMA transfer callback
+    static gdma_tx_event_callbacks_t tx_cbs = {
+        .on_trans_eof = gdma_on_trans_eof_callback};
+    gdma_register_tx_event_callbacks(dma_chan, &tx_cbs, NULL);
+    printf("__N__\n");
+
+
+    PERIPH_RCC_ATOMIC(){
+        printf("__P__\n");
+        parlio_ll_tx_enable_clock(&PARL_IO, false);
+    }
+    printf("__P__\n");
+    parlio_ll_tx_enable_clock_gating(&PARL_IO, 0);
+    printf("__Q__\n");
+    parlio_ll_tx_set_bus_width(&PARL_IO, 16);
+    parlio_ll_tx_treat_msb_as_valid(&PARL_IO, false);
+    printf("__R__\n");
+
+    auto sample_edge = _cfg.invert_pclk ? PARLIO_SAMPLE_EDGE_NEG : PARLIO_SAMPLE_EDGE_POS;
+    parlio_ll_tx_set_sample_clock_edge(&PARL_IO, sample_edge);
+    printf("__S__\n");
+
+    parlio_ll_clear_interrupt_status(&PARL_IO, PARLIO_LL_EVENT_TX_MASK);
+    printf("__T__\n");
+
+
+    int8_t *pins = _cfg.pin_data;
+    gpio_config_t gpio_conf = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    gpio_hal_context_t gpio_hal = {
+        .dev = GPIO_HAL_GET_HW(GPIO_PORT_0)
+    };
+
+    for (int i = 0; i < 16; i++)
+    {
+        if (pins[i] >= 0)
+        { // -1 value will CRASH the ESP32!
+            gpio_conf.pin_bit_mask = BIT64(pins[i]);
+            gpio_config(&gpio_conf);
+            esp_rom_gpio_connect_out_signal(pins[i], parlio_periph_signals.groups[0].tx_units[0].data_sigs[i], false, false);
+            gpio_hal_func_sel(&gpio_hal, GPIO_PIN_MUX_REG[pins[i]], PIN_FUNC_GPIO);
+            gpio_set_drive_capability((gpio_num_t)pins[i], (gpio_drive_cap_t)3);
+            printf("__U__ Configured data pin %d (GPIO %d)\n", i, pins[i]);
+        }
+    }
+    
+    printf("__V__\n");
+
+    // Clock
+    gpio_conf.pin_bit_mask = BIT64(_cfg.pin_wr);
+    gpio_config(&gpio_conf);
+    esp_rom_gpio_connect_out_signal(_cfg.pin_wr, parlio_periph_signals.groups[0].tx_units[0].clk_out_sig, _cfg.invert_pclk, false);
+    gpio_hal_func_sel(&gpio_hal, GPIO_PIN_MUX_REG[_cfg.pin_wr], PIN_FUNC_GPIO);
+    gpio_set_drive_capability((gpio_num_t)_cfg.pin_wr, (gpio_drive_cap_t)3);
+    printf("__W__ Clock pin configured (GPIO %d)\n", _cfg.pin_wr);
+
+    parlio_ll_tx_set_idle_data_value(&PARL_IO, 0);
+    parlio_ll_tx_set_trans_bit_len(&PARL_IO, 0);
+    printf("__X__\n");
+
+    printf("__Y__\n");
+
+    return true; // no return val = illegal instruction
 }
 
 void Bus_Parallel16::release(void)
 {
-    dma_bus_deinit();
-    
-    if (_parlio_unit) {
-        parlio_tx_unit_disable(_parlio_unit);
-        parlio_del_tx_unit(_parlio_unit);
-        _parlio_unit = nullptr;
+    if (_dmadesc_a)
+    {
+        heap_caps_free(_dmadesc_a);
+        _dmadesc_a = nullptr;
+       
     }
-    
-    _dmadesc_count = 0;
-    _is_transmitting = false;
-}
-
-void Bus_Parallel16::dma_bus_deinit(void)
-{
-    // Free GDMA link lists
-    if (_gdma_link_list_a) {
-        gdma_del_link_list(_gdma_link_list_a);
-        _gdma_link_list_a = nullptr;
-    }
-    
-    if (_gdma_link_list_a_loop) {
-        gdma_del_link_list(_gdma_link_list_a_loop);
-        _gdma_link_list_a_loop = nullptr;
-    }
-    
-    if (_gdma_link_list_b) {
-        gdma_del_link_list(_gdma_link_list_b);
-        _gdma_link_list_b = nullptr;
-    }
-    
-    if (_gdma_link_list_b_loop) {
-        gdma_del_link_list(_gdma_link_list_b_loop);
-        _gdma_link_list_b_loop = nullptr;
-    }
-    
-    _dmadesc_a_idx = 0;
-    _dmadesc_b_idx = 0;
-    _gdma_channel = nullptr;
-    _parlio_dma_link_default = nullptr;
-    
-    ESP_LOGI("P4_PARLIO_BCM", "DMA bus deinitialized");
+    if(_dmadesc_b){
+        heap_caps_free(_dmadesc_b);
+        _dmadesc_b = nullptr;
+    }   
+     _dmadesc_count = 0;
 }
 
 void Bus_Parallel16::enable_double_dma_desc(void)
 {
-    ESP_LOGI("P4_PARLIO_BCM", "Enabled support for secondary DMA buffer.");    
+    ESP_LOGI("P4", "Enabled support for secondary DMA buffer.");
     _double_dma_buffer = true;
 }
 
-bool Bus_Parallel16::allocate_dma_desc_memory(uint16_t num_descriptors)
+// Need this to work for double buffers etc.
+bool Bus_Parallel16::allocate_dma_desc_memory(size_t len)
 {
-    if (num_descriptors == 0) {
-        ESP_LOGE("P4_PARLIO_BCM", "Number of descriptors must be greater than 0");
+    if (_dmadesc_a)
+        heap_caps_free(_dmadesc_a); // free all dma descrptios previously
+    _dmadesc_count = len;
+
+    ESP_LOGD("P4", "Allocating %d bytes memory for DMA descriptors.", (int)sizeof(HUB75_DMA_DESCRIPTOR_T) * len);
+
+    _dmadesc_a = (HUB75_DMA_DESCRIPTOR_T *)heap_caps_malloc(sizeof(HUB75_DMA_DESCRIPTOR_T) * len, MALLOC_CAP_DMA);
+
+    if (_dmadesc_a == nullptr)
+    {
+        ESP_LOGE("P4", "ERROR: Couldn't malloc _dmadesc_a. Not enough memory.");
         return false;
     }
-    
-    // Free existing allocations if any
-    dma_bus_deinit();
-    
-    ESP_LOGI("P4_PARLIO_BCM", "Allocating 4 GDMA link lists for %d descriptors each", num_descriptors);
-    
-    _dmadesc_count = num_descriptors;
-    _max_descriptor_count = num_descriptors;
+
+    if (_double_dma_buffer)
+    {
+        _dmadesc_b = (HUB75_DMA_DESCRIPTOR_T *)heap_caps_malloc(sizeof(HUB75_DMA_DESCRIPTOR_T) * len, MALLOC_CAP_DMA);
+
+        if (_dmadesc_b == nullptr)
+        {
+            ESP_LOGE("P4", "ERROR: Couldn't malloc _dmadesc_b. Not enough memory.");
+            _double_dma_buffer = false;
+        }
+    }
+
+    /// override static
     _dmadesc_a_idx = 0;
     _dmadesc_b_idx = 0;
-    
-    // Access the internal GDMA channel from PARLIO unit
-    if (!_parlio_unit) {
-        ESP_LOGE("P4_PARLIO_BCM", "PARLIO unit not initialized");
-        return false;
-    }
-    
-    // Get PARLIO's internal GDMA channel and default DMA link (accessing private structure)
-    parlio_tx_unit_t* tx_unit = (parlio_tx_unit_t*)_parlio_unit;
-    _gdma_channel = tx_unit->dma_chan;
-    
-    // Store reference to PARLIO's default DMA link list (index 0)
-    if (tx_unit->dma_link[0]) {
-        _parlio_dma_link_default = tx_unit->dma_link[0];
-        ESP_LOGI("P4_PARLIO_BCM", "Captured PARLIO default DMA link: %p", _parlio_dma_link_default);
-    } else {
-        ESP_LOGW("P4_PARLIO_BCM", "PARLIO default DMA link is NULL");
-    }
-    
-    ESP_LOGI("P4_PARLIO_BCM", "GDMA Channel address: %p", _gdma_channel);
-    //dump_parlio_tx_unit(tx_unit);
 
-    
-    // Create GDMA link lists for manual descriptor management
-    gdma_link_list_config_t link_config = {
-        .num_items = num_descriptors,
-        .flags = {
-            .items_in_ext_mem = false,
-            .check_owner = false,
-        }
-    };
-    
-    // Allocate link list A (main list)
-    esp_err_t ret = gdma_new_link_list(&link_config, &_gdma_link_list_a);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to create GDMA link list A: %s", esp_err_to_name(ret));
-        return false;
-    }
-    
-    // Allocate link list A loop (loops back to itself by default)
-    ret = gdma_new_link_list(&link_config, &_gdma_link_list_a_loop);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to create GDMA link list A loop: %s", esp_err_to_name(ret));
-        gdma_del_link_list(_gdma_link_list_a);
-        _gdma_link_list_a = nullptr;
-        return false;
-    }
-    
-    // Allocate link list B if double buffering is enabled
-    if (_double_dma_buffer) {
-        ret = gdma_new_link_list(&link_config, &_gdma_link_list_b);
-        if (ret != ESP_OK) {
-            ESP_LOGE("P4_PARLIO_BCM", "Failed to create GDMA link list B: %s", esp_err_to_name(ret));
-            gdma_del_link_list(_gdma_link_list_a);
-            gdma_del_link_list(_gdma_link_list_a_loop);
-            _gdma_link_list_a = nullptr;
-            _gdma_link_list_a_loop = nullptr;
-            return false;
-        }
-        
-        // Allocate link list B loop (loops back to itself by default)
-        ret = gdma_new_link_list(&link_config, &_gdma_link_list_b_loop);
-        if (ret != ESP_OK) {
-            ESP_LOGE("P4_PARLIO_BCM", "Failed to create GDMA link list B loop: %s", esp_err_to_name(ret));
-            gdma_del_link_list(_gdma_link_list_a);
-            gdma_del_link_list(_gdma_link_list_a_loop);
-            gdma_del_link_list(_gdma_link_list_b);
-            _gdma_link_list_a = nullptr;
-            _gdma_link_list_a_loop = nullptr;
-            _gdma_link_list_b = nullptr;
-            return false;
-        }
-    }
-    
-    ESP_LOGI("P4_PARLIO_BCM", "Successfully allocated 4 GDMA link lists for manual descriptor management");
-    ESP_LOGI("P4_PARLIO_BCM", "Link lists: A=%p, A_loop=%p, B=%p, B_loop=%p", 
-             _gdma_link_list_a, _gdma_link_list_a_loop, _gdma_link_list_b, _gdma_link_list_b_loop);
-    
     return true;
 }
 
 void Bus_Parallel16::create_dma_desc_link(void *data, size_t size, bool dmadesc_b)
 {
-    // This function creates GDMA link items in our custom link lists
-    // We populate both the main list and the loop list with the same data
-    
-    if (size == 0 || data == nullptr) {
-        ESP_LOGW("P4_PARLIO_BCM", "Invalid data or size in create_dma_desc_link");
-        return;
+    static constexpr size_t MAX_DMA_LEN = (4096 - 4);
+
+    if (size > MAX_DMA_LEN)
+    {
+        size = MAX_DMA_LEN;
+        ESP_LOGW("P4", "Creating DMA descriptor which links to payload with size greater than MAX_DMA_LEN!");
     }
-    
-    if (size > PARLIO_DMA_DESCRIPTOR_BUFFER_MAX_SIZE) {
-        size = PARLIO_DMA_DESCRIPTOR_BUFFER_MAX_SIZE;
-        ESP_LOGW("P4_PARLIO_BCM", "Limiting descriptor size to %d bytes", PARLIO_DMA_DESCRIPTOR_BUFFER_MAX_SIZE);
-    }
-    
-    // Select the appropriate pair of link lists (main and loop)
-    gdma_link_list_handle_t target_list = dmadesc_b ? _gdma_link_list_b : _gdma_link_list_a;
-    gdma_link_list_handle_t target_list_loop = dmadesc_b ? _gdma_link_list_b_loop : _gdma_link_list_a_loop;
-    uint32_t* current_idx = dmadesc_b ? &_dmadesc_b_idx : &_dmadesc_a_idx;
-    
-    if (target_list == nullptr || target_list_loop == nullptr) {
-        ESP_LOGE("P4_PARLIO_BCM", "Target GDMA link lists not allocated");
-        return;
-    }
-    
-    if (*current_idx >= _max_descriptor_count) {
-        ESP_LOGE("P4_PARLIO_BCM", "Exceeded maximum descriptor count: %d", _max_descriptor_count);
-        return;
-    }
-    
-    // Configure buffer mount for this descriptor
-    gdma_buffer_mount_config_t buf_config = {
-        .buffer = data,
-        .length = size,
-        .flags = {
-            .mark_eof = 0,      // Don't mark EOF for individual descriptors
-            .mark_final = 0,    // Don't mark final, we'll link manually
-            .bypass_buffer_align_check = 0
+
+    if (dmadesc_b == true)
+    {
+
+        _dmadesc_b[_dmadesc_b_idx].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        //_dmadesc_b[_dmadesc_b_idx].dw0.suc_eof = 0;
+        _dmadesc_b[_dmadesc_b_idx].dw0.suc_eof = (_dmadesc_b_idx == (_dmadesc_count - 1));
+        _dmadesc_b[_dmadesc_b_idx].dw0.size = _dmadesc_b[_dmadesc_b_idx].dw0.length = size; // sizeof(data);
+        _dmadesc_b[_dmadesc_b_idx].buffer = data;                                           // data;
+
+        if (_dmadesc_b_idx == _dmadesc_count - 1)
+        {
+            _dmadesc_b[_dmadesc_b_idx].next = (dma_descriptor_t *)&_dmadesc_b[0];
         }
-    };
-    
-    // Mount buffer to both the main link list and the loop link list
-    int end_item_index;
-    esp_err_t ret = gdma_link_mount_buffers(target_list, *current_idx, &buf_config, 1, &end_item_index);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to mount buffer to GDMA link list (main): %s", esp_err_to_name(ret));
-        return;
+        else
+        {
+            _dmadesc_b[_dmadesc_b_idx].next = (dma_descriptor_t *)&_dmadesc_b[_dmadesc_b_idx + 1];
+        }
+
+        _dmadesc_b_idx++;
     }
-    
-    ret = gdma_link_mount_buffers(target_list_loop, *current_idx, &buf_config, 1, &end_item_index);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to mount buffer to GDMA link list (loop): %s", esp_err_to_name(ret));
-        return;
+    else
+    {
+
+        if (_dmadesc_a_idx >= _dmadesc_count)
+        {
+            ESP_LOGE("P4", "Attempted to create more DMA descriptors than allocated. Expecting max %u descriptors.", (unsigned int)_dmadesc_count);
+            return;
+        }
+
+        _dmadesc_a[_dmadesc_a_idx].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        //_dmadesc_a[_dmadesc_a_idx].dw0.suc_eof = 0;
+        _dmadesc_a[_dmadesc_a_idx].dw0.suc_eof = (_dmadesc_a_idx == (_dmadesc_count - 1));
+        _dmadesc_a[_dmadesc_a_idx].dw0.size = _dmadesc_a[_dmadesc_a_idx].dw0.length = size; // sizeof(data);
+        _dmadesc_a[_dmadesc_a_idx].buffer = data;                                           // data;
+
+        if (_dmadesc_a_idx == _dmadesc_count - 1)
+        {
+            _dmadesc_a[_dmadesc_a_idx].next = (dma_descriptor_t *)&_dmadesc_a[0];
+        }
+        else
+        {
+            _dmadesc_a[_dmadesc_a_idx].next = (dma_descriptor_t *)&_dmadesc_a[_dmadesc_a_idx + 1];
+        }
+
+        _dmadesc_a_idx++;
     }
-    
-    // If this is the last descriptor, configure the linking behavior
-    if (*current_idx == _dmadesc_count - 1) {
-        // Make the loop list loop back to itself
-        // By default, GDMA link lists are circular, but we'll ensure proper linking during transfer start
-        ESP_LOGI("P4_PARLIO_BCM", "Configured last descriptor %d for buffer %c", *current_idx, dmadesc_b ? 'B' : 'A');
-    }
-    
-    (*current_idx)++;
-    
-    ESP_LOGV("P4_PARLIO_BCM", "Created DMA descriptor %d for buffer %c: ptr=%p, size=%zu", 
-             *current_idx - 1, dmadesc_b ? 'B' : 'A', data, size);
-}
+
+} // end create_dma_desc_link
 
 void Bus_Parallel16::dma_transfer_start()
 {
-    if (!_parlio_unit || !_gdma_channel || !_gdma_link_list_a || !_gdma_link_list_a_loop) {
-        ESP_LOGE("P4_PARLIO_BCM", "PARLIO unit, GDMA channel, or link lists not initialized");
-        return;
-    }
-    
-    // Strategy: Link our custom lists together to create a continuous loop
-    // 1. _gdma_link_list_a (main list with BCM data)
-    // 2. _gdma_link_list_a_loop (same data, continues the loop)
-    // 
-    // Linking: main_list -> loop_list -> main_list (creates infinite loop)
-    
-    // Select the active list pair based on current buffer
-    gdma_link_list_handle_t active_list = _gdma_link_list_a;
-    gdma_link_list_handle_t active_loop_list = _gdma_link_list_a_loop;
-    
-    if (_double_dma_buffer && _current_buffer_id == 1 && _gdma_link_list_b && _gdma_link_list_b_loop) {
-        active_list = _gdma_link_list_b;
-        active_loop_list = _gdma_link_list_b_loop;
-    }
-    
-    // Get the head addresses - these are physical addresses for DMA
-    intptr_t loop_list_head = gdma_link_get_head_addr(active_loop_list);
-    intptr_t main_list_head = gdma_link_get_head_addr(active_list);
-    
-    ESP_LOGI("P4_PARLIO_BCM", "Main list head: 0x%08" PRIxPTR ", Loop list head: 0x%08" PRIxPTR, main_list_head, loop_list_head);
-    
-    // Concatenate the lists to create the loop:
-    // Link the last item (-1) of main list to the first item (0) of loop list
-    // Link the last item (-1) of loop list to the first item (0) of main list (circular)
-    esp_err_t ret = gdma_link_concat(active_list, -1, active_loop_list, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to concatenate main[-1]->loop[0]: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI("P4_PARLIO_BCM", "Successfully concatenated main list to loop list");
-    }
-    
-    // Make the loop list point back to the main list (create circular loop)
-    ret = gdma_link_concat(active_loop_list, -1, active_list, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE("P4_PARLIO_BCM", "Failed to concatenate loop[-1]->main[0]: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI("P4_PARLIO_BCM", "Successfully concatenated loop list back to main list (circular)");
-    }
-    
-    // Set DMA ownership to DMA controller (not CPU)
-    // This tells the DMA that it can start processing these descriptors
-    // Set ownership for all items in both lists
-    for (uint32_t i = 0; i < _dmadesc_count; i++) {
-        ret = gdma_link_set_owner(active_list, i, GDMA_LLI_OWNER_DMA);
-        if (ret != ESP_OK) {
-            ESP_LOGW("P4_PARLIO_BCM", "Failed to set owner for main list[%d]: %s", i, esp_err_to_name(ret));
-        }
+    printf("__A__\n");
+    PERIPH_RCC_ATOMIC() { 
+        printf("__A__\n");
+        parlio_ll_tx_reset_fifo(&PARL_IO);
+        printf("__A__\n");
+        parlio_ll_tx_reset_clock(&PARL_IO);
         
-        ret = gdma_link_set_owner(active_loop_list, i, GDMA_LLI_OWNER_DMA);
-        if (ret != ESP_OK) {
-            ESP_LOGW("P4_PARLIO_BCM", "Failed to set owner for loop list[%d]: %s", i, esp_err_to_name(ret));
-        }
+        printf("__A__\n");
+        gdma_start(dma_chan, (intptr_t)&_dmadesc_a[0]);
+        
+        printf("__A__\n");
+        while (parlio_ll_tx_is_ready(&PARL_IO) == false);
+
+        printf("__A__\n");
+        parlio_ll_tx_start(&PARL_IO, true);
+        printf("__A__\n");
+        parlio_ll_tx_enable_clock(&PARL_IO, true);
+        printf("__A__\n");
     }
-    
-    ESP_LOGI("P4_PARLIO_BCM", "Set DMA ownership for all %d descriptors in both lists", _dmadesc_count);
-    
-    // Link PARLIO's default DMA lists to our custom ones
-    // Instead of replacing, we concatenate the PARLIO default link to our main list
-    parlio_tx_unit_t* tx_unit = (parlio_tx_unit_t*)_parlio_unit;
-    
-    if (_parlio_dma_link_default) {
-        // Link the last item of PARLIO's default list to the first item of our main list
-        ret = gdma_link_concat(_parlio_dma_link_default, -1, active_list, 0);
-        if (ret != ESP_OK) {
-            ESP_LOGE("P4_PARLIO_BCM", "Failed to link PARLIO default to our main list: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI("P4_PARLIO_BCM", "Successfully linked PARLIO default -> our main list -> loop list (circular)");
-        }
-    } else {
-        ESP_LOGW("P4_PARLIO_BCM", "No PARLIO default link found, cannot link to our lists");
-    }
-    
-    _is_transmitting = true;
-    ESP_LOGI("P4_PARLIO_BCM", "DMA transfer configured with link list %c", 
-             (active_list == _gdma_link_list_a) ? 'A' : 'B');
-    ESP_LOGI("P4_PARLIO_BCM", "PARLIO DMA is already running, no need to call gdma_start()");
-}
+
+} // end
 
 void Bus_Parallel16::dma_transfer_stop()
 {
-    if (_gdma_channel && _is_transmitting) {
-        esp_err_t ret = gdma_stop(_gdma_channel);
-        if (ret != ESP_OK) {
-            ESP_LOGE("P4_PARLIO_BCM", "Failed to stop GDMA transfer: %s", esp_err_to_name(ret));
-        }
-        _is_transmitting = false;
-        ESP_LOGD("P4_PARLIO_BCM", "Stopped GDMA transfer");
-    }
-}
+
+    gdma_stop(dma_chan);
+
+} // end
 
 void Bus_Parallel16::flip_dma_output_buffer(int back_buffer_id)
 {
-    if (!_double_dma_buffer || !_gdma_link_list_b || !_gdma_link_list_b_loop) {
-        return;
-    }
-    
-    // Strategy for double buffering:
-    // We need to re-link the new buffer pair and update PARLIO's dma_link array
-    // The new buffer will be picked up on the next DMA cycle
-    
-    _current_buffer_id = back_buffer_id;
-    
-    gdma_link_list_handle_t new_list;
-    gdma_link_list_handle_t new_loop_list;
-    
-    if (back_buffer_id == 1) {
-        // Switch to buffer B
-        new_list = _gdma_link_list_b;
-        new_loop_list = _gdma_link_list_b_loop;
-    }
-    else {
-        // Switch to buffer A
-        new_list = _gdma_link_list_a;
-        new_loop_list = _gdma_link_list_a_loop;
-    }
-    
-    // Re-concatenate the new buffer pair to ensure proper circular linking
-    esp_err_t ret = gdma_link_concat(new_list, -1, new_loop_list, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGW("P4_PARLIO_BCM", "Failed to concatenate new main[-1]->loop[0]: %s", esp_err_to_name(ret));
-    }
-    
-    ret = gdma_link_concat(new_loop_list, -1, new_list, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGW("P4_PARLIO_BCM", "Failed to concatenate new loop[-1]->main[0]: %s", esp_err_to_name(ret));
-    }
-    
-    // Set ownership to DMA for all descriptors
-    for (uint32_t i = 0; i < _dmadesc_count; i++) {
-        ret = gdma_link_set_owner(new_list, i, GDMA_LLI_OWNER_DMA);
-        if (ret != ESP_OK) {
-            ESP_LOGW("P4_PARLIO_BCM", "Failed to set owner for new main list[%d]: %s", i, esp_err_to_name(ret));
-        }
-        
-        ret = gdma_link_set_owner(new_loop_list, i, GDMA_LLI_OWNER_DMA);
-        if (ret != ESP_OK) {
-            ESP_LOGW("P4_PARLIO_BCM", "Failed to set owner for new loop list[%d]: %s", i, esp_err_to_name(ret));
-        }
-    }
-    
-    // Link PARLIO's default DMA list to the new buffer
-    if (_parlio_dma_link_default) {
-        // Re-link the last item of PARLIO's default list to the first item of our new main list
-        ret = gdma_link_concat(_parlio_dma_link_default, -1, new_list, 0);
-        if (ret != ESP_OK) {
-            ESP_LOGW("P4_PARLIO_BCM", "Failed to re-link PARLIO default to new buffer: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGD("P4_PARLIO_BCM", "Successfully re-linked PARLIO default to buffer %c", back_buffer_id == 1 ? 'B' : 'A');
-        }
-    }
-    
-    ESP_LOGD("P4_PARLIO_BCM", "Flipped to buffer %c", back_buffer_id == 1 ? 'B' : 'A');
-    
-    // Note: The actual switch will happen on the next DMA descriptor chain completion
-    // PARLIO's hardware will automatically pick up the new link when the current one completes
-}
 
-// Callback implementations
-static IRAM_ATTR bool parlio_tx_buffer_switched_callback(parlio_tx_unit_handle_t tx_unit, 
-                                                        const parlio_tx_buffer_switched_event_data_t *event_data, 
-                                                        void *user_data)
-{
-    Bus_Parallel16* bus = (Bus_Parallel16*)user_data;
-    ESP_EARLY_LOGI("P4_PARLIO_BCM", "ARLIO buffer switched:e");
-    if (bus && event_data) {
-        // This callback is triggered when PARLIO internally switches buffers in loop mode
-        // It indicates that the hardware has switched from one DMA buffer to another
-        // This is useful for timing-sensitive applications like display refresh
-        
-        ESP_EARLY_LOGD("P4_PARLIO_BCM", "PARLIO buffer switched: %p -> %p", 
-                      event_data->old_buffer_addr, event_data->new_buffer_addr);
-        
-        // You can use this callback to:
-        // 1. Update display driver state
-        // 2. Prepare the next frame data
-        // 3. Synchronize with display refresh timing
-        // 4. Signal application that it's safe to modify the old buffer
-    }
-    
-    return false; // Don't yield from ISR
-}
+    // if ( _double_dma_buffer == false) return;
 
-static IRAM_ATTR bool parlio_tx_done_callback(parlio_tx_unit_handle_t tx_unit, 
-                                              const parlio_tx_done_event_data_t *event_data, 
-                                              void *user_data)
-{
-    Bus_Parallel16* bus = (Bus_Parallel16*)user_data;
-    
-    // This callback is triggered when a non-loop transmission completes
-    // In loop mode, this might not be called as frequently
-    transmission_complete = true;
-    ESP_EARLY_LOGI("P4_PARLIO_BCM", "PARLIO transmission doneA");
-    if (bus) {
-        // Mark transmission as complete
-        // Note: In loop mode, this may indicate end of one loop iteration
-        ESP_EARLY_LOGD("P4_PARLIO_BCM", "PARLIO transmission done");
+    if (back_buffer_id == 1) // change across to everything 'b''
+    {
+        _dmadesc_a[_dmadesc_count - 1].next = (dma_descriptor_t *)&_dmadesc_b[0];
+        _dmadesc_b[_dmadesc_count - 1].next = (dma_descriptor_t *)&_dmadesc_b[0];
     }
-    
-    return false; // Don't yield from ISR
-}
+    else
+    {
+        _dmadesc_b[_dmadesc_count - 1].next = (dma_descriptor_t *)&_dmadesc_a[0];
+        _dmadesc_a[_dmadesc_count - 1].next = (dma_descriptor_t *)&_dmadesc_a[0];
+    }
 
-#endif // SOC_PARLIO_SUPPORTED
+    previousBufferFree = false;
+
+    while (!previousBufferFree)  ;
+
+} // end flip
 
 #endif

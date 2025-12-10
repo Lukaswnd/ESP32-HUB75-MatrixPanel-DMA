@@ -5,7 +5,7 @@
  */
 
 #pragma once
-
+#if 0
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -228,4 +228,5 @@ void parlio_create_retention_module(parlio_group_t *group);
 
 #ifdef __cplusplus
 }
+#endif
 #endif
